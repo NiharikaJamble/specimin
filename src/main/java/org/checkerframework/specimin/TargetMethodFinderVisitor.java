@@ -2,6 +2,7 @@ package org.checkerframework.specimin;
 
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.EnumConstantDeclaration;
@@ -32,6 +33,7 @@ import com.github.javaparser.resolution.declarations.ResolvedConstructorDeclarat
 import com.github.javaparser.resolution.declarations.ResolvedEnumConstantDeclaration;
 import com.github.javaparser.resolution.declarations.ResolvedFieldDeclaration;
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
+import com.github.javaparser.resolution.declarations.ResolvedParameterDeclaration;
 import com.github.javaparser.resolution.declarations.ResolvedTypeParameterDeclaration;
 import com.github.javaparser.resolution.declarations.ResolvedValueDeclaration;
 import com.github.javaparser.resolution.types.ResolvedReferenceType;
@@ -69,6 +71,9 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
 
   /** The fully-qualified name of the class currently being visited. */
   private String classFQName = "";
+
+  /** The name of the package currently being visited. */
+  private String currentPackage = "";
 
   /**
    * The members (methods and fields) that were actually used by the targets, and therefore ought to
@@ -247,6 +252,12 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
         unfoundMethods.get(targetMethodInClass).add(methodAsString);
       }
     }
+  }
+
+  @Override
+  public Visitable visit(PackageDeclaration decl, Void p) {
+    this.currentPackage = decl.getNameAsString();
+    return super.visit(decl, p);
   }
 
   @Override
@@ -546,7 +557,35 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
         // leading to a RuntimeException.
         // Note: this preservation is safe because we are not having an UnsolvedSymbolException.
         // Only unsolved symbols can make the output failed to compile.
-        resolvedYetStuckMethodCall.add(this.classFQName + "." + call.getNameAsString());
+        if (call.hasScope()) {
+          Expression scope = call.getScope().orElseThrow();
+          String scopeAsString = scope.toString();
+          if (scopeAsString.equals("this") || scopeAsString.equals("super")) {
+            // In the "super" case, it would be better to add the name of an
+            // extended or implemented class/interface. However, there are two complications:
+            // 1) we currently don't track the list of classes/interfaces that the current class
+            // extends and/or implements in this visitor and 2) even if we did track that, there
+            // is no way for us to know which of those classes/interfaces the method belongs to.
+            // TODO: write a test for the "super" case and then figure out a better way to handle
+            // it.
+            resolvedYetStuckMethodCall.add(this.classFQName + "." + call.getNameAsString());
+          } else {
+            // Use the scope instead. There are two cases: the scope is an FQN (e.g., in
+            // a call to a fully-qualified static method) or the scope is a simple name.
+            // In the simple name case, append the current package to the front, since
+            // if it had been imported we wouldn't be in this situation.
+            if (UnsolvedSymbolVisitor.isAClassPath(scopeAsString)) {
+              resolvedYetStuckMethodCall.add(scopeAsString + "." + call.getNameAsString());
+              usedTypeElement.add(scopeAsString);
+            } else {
+              resolvedYetStuckMethodCall.add(
+                  getCurrentPackage() + "." + scopeAsString + "." + call.getNameAsString());
+              usedTypeElement.add(getCurrentPackage() + "." + scopeAsString);
+            }
+          }
+        } else {
+          resolvedYetStuckMethodCall.add(this.classFQName + "." + call.getNameAsString());
+        }
         return super.visit(call, p);
       }
       preserveMethodDecl(decl);
@@ -586,6 +625,22 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
     catch (UnsolvedSymbolException e) {
       return;
     }
+
+    for (int i = 0; i < decl.getNumberOfParams(); ++i) {
+      // Why is there no getParams() method??
+      ResolvedParameterDeclaration p = decl.getParam(i);
+      ResolvedType pType = p.getType();
+      updateUsedClassBasedOnType(pType);
+    }
+  }
+
+  /**
+   * Gets the package name of the current class.
+   *
+   * @return the current package name
+   */
+  private String getCurrentPackage() {
+    return currentPackage;
   }
 
   @Override
@@ -611,12 +666,22 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
   @Override
   public Visitable visit(ObjectCreationExpr newExpr, Void p) {
     if (insideTargetMember) {
-      ResolvedConstructorDeclaration resolved = newExpr.resolve();
-      usedMembers.add(resolved.getQualifiedSignature());
-      updateUsedClassWithQualifiedClassName(
-          resolved.getPackageName() + "." + resolved.getClassName(),
-          usedTypeElement,
-          nonPrimaryClassesToPrimaryClass);
+      try {
+        ResolvedConstructorDeclaration resolved = newExpr.resolve();
+        usedMembers.add(resolved.getQualifiedSignature());
+        updateUsedClassWithQualifiedClassName(
+            resolved.getPackageName() + "." + resolved.getClassName(),
+            usedTypeElement,
+            nonPrimaryClassesToPrimaryClass);
+        for (int i = 0; i < resolved.getNumberOfParams(); ++i) {
+          // Why is there no getParams() method??
+          ResolvedParameterDeclaration param = resolved.getParam(i);
+          ResolvedType pType = param.getType();
+          updateUsedClassBasedOnType(pType);
+        }
+      } catch (UnsolvedSymbolException e) {
+        throw new RuntimeException("trying to resolve : " + newExpr, e);
+      }
     }
     return super.visit(newExpr, p);
   }
@@ -880,7 +945,9 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
 
   /**
    * Updates the list of used classes based on the resolved type of a used element, where a element
-   * can be a method, a field, a variable, or a parameter.
+   * can be a method, a field, a variable, or a parameter. Also updates the set of used classes
+   * based on component types, wildcard bounds, etc., as needed: any type that is used in the type
+   * will be included.
    *
    * @param type The resolved type of the used element.
    */
@@ -893,6 +960,10 @@ public class TargetMethodFinderVisitor extends ModifierVisitor<Void> {
         updateUsedClassWithQualifiedClassName(
             bound.getType().describe(), usedTypeElement, nonPrimaryClassesToPrimaryClass);
       }
+      return;
+    } else if (type.isArray()) {
+      ResolvedType componentType = type.asArrayType().getComponentType();
+      updateUsedClassBasedOnType(componentType);
       return;
     }
     updateUsedClassWithQualifiedClassName(
