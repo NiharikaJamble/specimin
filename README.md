@@ -42,10 +42,21 @@ Options may be specified in any order. When supplying repeatable options more th
 
 Here is a sample command to run the tool: `./gradlew run --args='--outputDirectory "tempDir" --root "src/test/resources/twofilesimple/input/" --targetFile "com/example/Foo.java" --targetFile "com/example/Baz.java" --targetMethod "com.example.Foo#bar()" --jarpath "path/to/jar/directory"'`
 
+# Important limitations and caveats
+
+The implementation makes use of heuristics to distinguish simple names from fully-qualified names
+at several points during approximate slicing. In particular, it assumes that package and class names
+follow Java convention:
+* class names always begin with an uppercase letter
+* package names always begin with a lowercase letter
+
+Specimin will likely produce incorrect output if the input program does not follow this convention
+when the program's full classpath is not provided as a `--jarPath` input.
+
 # Input/output examples
 
 The following examples illustrate the kinds of programs that Specimin
-produces. You can find (many) more such examples in Specimin's 
+produces. You can find (many) more such examples in Specimin's
 [test suite](https://github.com/kelloggm/specimin/tree/main/src/test/resources).
 
 ## A very simple example
@@ -246,3 +257,12 @@ In cases like these, Specimin chooses the latter: it assumes that the JDK
 is available. If you want to target part of the JDK itself with Specimin,
 this means that it's necessary to *relocate* JDK classes (into a non `java.*`
 package); see the CF-577 test in the integration tests for an example.
+
+### Reporting issues and contributing
+
+We welcome bug reports. Please make a GitHub issue with the command
+that you used to run Specimin and describe what went wrong, and we'll
+look into it as soon as we can.
+
+If you'd like to contribute to Specimin, we have a separate document
+with [developer documentation](https://github.com/njit-jerse/specimin/DEVELOPERS.md).
