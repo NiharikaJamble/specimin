@@ -17,7 +17,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v2
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -43,7 +43,12 @@ jobs:
       - name: Display CSV File Contents loaded in working environment
         run: |
           set -ex
-          cat /home/runner/work/specimin/specimin/CI_repository_list.csv   
+          if [ -f /home/runner/work/specimin/specimin/CI_repository_list.csv ]; then
+            cat /home/runner/work/specimin/specimin/CI_repository_list.csv
+          else
+            echo "File /home/runner/work/specimin/specimin/CI_repository_list.csv does not exist"
+            exit 1
+          fi
 
       - name: Clone ASHE Project 
         run: |
