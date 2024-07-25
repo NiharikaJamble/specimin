@@ -17,9 +17,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v2
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
 
+      - name: Debug - Show Current Branch
+        run: |
+          set -ex
+          echo "Current branch: $(git branch --show-current)"
+
+      - name: Debug - List Files in Repository
+        run: |
+          set -ex
+          echo "Current directory: $(pwd)"
+          echo "Listing files in /home/runner/work/specimin/specimin"
+          ls -la /home/runner/work/specimin/specimin
+          
+          
       - name: Set up Python
         uses: actions/setup-python@v2
         with:
