@@ -172,7 +172,7 @@ jobs:
           sudo apt-get install -y jq curl
 
       - name: Update Evaluation Accuracy Secret
-        if: steps.read_and_update.outputs.update_needed == 'true'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.read_and_update.outputs.update_needed == 'true'
         run: |
           set -ex
           new_accuracy=${{ steps.read_and_update.outputs.new_accuracy }}
