@@ -106,8 +106,9 @@ public class JavaParserUtil {
   public static String getValueTypeFromAnnotationExpression(Expression value) {
     if (value.isBooleanLiteralExpr()) {
       return "boolean";
-    } else if (value.isStringLiteralExpr()) {
-      return "String";
+    } 
+    //else if (value.isStringLiteralExpr()) {
+      //return "String";
     } else if (value.isIntegerLiteralExpr()) {
       return "int";
     } else if (value.isLongLiteralExpr()) {
