@@ -223,6 +223,12 @@ public class PrunerVisitor extends SpeciminStateVisitor {
         String typeFullName =
             JavaParserUtil.classOrInterfaceTypeToResolvedReferenceType(interfaceType)
                 .getQualifiedName();
+
+        // Never remove java.lang.AutoCloseable, because it will create compilation
+        // errors at try-with-resources statements.
+        if (typeFullName.equals("java.lang.AutoCloseable")) {
+          continue;
+        }
         if (!usedTypeElements.contains(typeFullName)) {
           iterator.remove();
         }
@@ -318,10 +324,11 @@ public class PrunerVisitor extends SpeciminStateVisitor {
 
   @Override
   public Visitable visit(MethodDeclaration methodDecl, Void p) {
+    String signature;
     try {
       // resolved() will only check if the return type is solvable
       // getQualifiedSignature() will also check if the parameters are solvable
-      methodDecl.resolve().getQualifiedSignature();
+      signature = methodDecl.resolve().getQualifiedSignature();
     } catch (UnsolvedSymbolException e) {
       // The current class is employed by the target methods, although not all of its members are
       // utilized. It's not surprising for unused members to remain unresolved.
@@ -329,10 +336,16 @@ public class PrunerVisitor extends SpeciminStateVisitor {
       return methodDecl;
     }
 
-    ResolvedMethodDeclaration resolved = methodDecl.resolve();
-    String signature = resolved.getQualifiedSignature();
     if (targetMethods.contains(signature)) {
       return super.visit(methodDecl, p);
+    }
+
+    if (insideFunctionalInterface && usedMembers.contains(signature)) {
+      if (methodDecl.getBody().isPresent()) {
+        // avoid introducing unsolved symbols into the final output.
+        methodDecl.setBody(StaticJavaParser.parseBlock("{ throw new Error(); }"));
+      }
+      return methodDecl;
     }
 
     if (usedMembers.contains(signature) || isAResolvedYetStuckMethod(methodDecl)) {
@@ -344,14 +357,6 @@ public class PrunerVisitor extends SpeciminStateVisitor {
         if (isMethodInsideInterface && !methodDecl.isStatic()) {
           methodDecl.setDefault(true);
         }
-      }
-      return methodDecl;
-    }
-
-    if (insideFunctionalInterface) {
-      if (methodDecl.getBody().isPresent()) {
-        // avoid introducing unsolved symbols into the final output.
-        methodDecl.setBody(StaticJavaParser.parseBlock("{ throw new Error(); }"));
       }
       return methodDecl;
     }
@@ -438,9 +443,13 @@ public class PrunerVisitor extends SpeciminStateVisitor {
       if (targetFields.contains(varFullName)) {
         continue;
       } else if (usedMembers.contains(varFullName)) {
-        declarator.removeInitializer();
         if (isFinal) {
-          declarator.setInitializer(getBasicInitializer(declarator.getType()));
+          if (!fieldsAssignedByTargetCtors.contains(varFullName)) {
+            declarator.removeInitializer();
+            declarator.setInitializer(getBasicInitializer(declarator.getType()));
+          }
+        } else {
+          declarator.removeInitializer();
         }
       } else {
         iterator.remove();

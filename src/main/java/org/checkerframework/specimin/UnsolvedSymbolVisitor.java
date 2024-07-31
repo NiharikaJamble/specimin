@@ -32,6 +32,7 @@ import com.github.javaparser.ast.expr.SimpleName;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.SwitchExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
+import com.github.javaparser.ast.expr.VariableDeclarationExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.CatchClause;
 import com.github.javaparser.ast.stmt.ExplicitConstructorInvocationStmt;
@@ -90,6 +91,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import org.checkerframework.checker.signature.qual.ClassGetSimpleName;
 import org.checkerframework.checker.signature.qual.DotSeparatedIdentifiers;
 import org.checkerframework.checker.signature.qual.FullyQualifiedName;
+import org.checkerframework.specimin.modularity.ModularityModel;
 
 /**
  * The visitor for the preliminary phase of Specimin. This visitor goes through the input files,
@@ -233,17 +235,20 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
    * @param targetMethodsSignatures the list of signatures of target methods as specified by the
    *     user.
    * @param targetFieldsSignature the list of signatures of target fields as specified by the user.
+   * @param model the modularity model selected by the user
    */
   public UnsolvedSymbolVisitor(
       String rootDirectory,
       Map<String, Path> existingClassesToFilePath,
       Set<String> targetMethodsSignatures,
-      Set<String> targetFieldsSignature) {
+      Set<String> targetFieldsSignature,
+      ModularityModel model) {
     super(
         targetMethodsSignatures,
         targetFieldsSignature,
         new HashSet<>(),
         new HashSet<>(),
+        model,
         existingClassesToFilePath);
     this.rootDirectory = rootDirectory;
     this.gotException = true;
@@ -640,9 +645,85 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
   public Visitable visit(TryStmt node, Void p) {
     HashSet<String> currentLocalVariables = new HashSet<>();
     localVariables.addFirst(currentLocalVariables);
+    List<Expression> resources = node.getResources();
+    if (resources.size() != 0) {
+      handleSyntheticResources(resources);
+    }
     Visitable result = super.visit(node, p);
     localVariables.removeFirst();
     return result;
+  }
+
+  /**
+   * Ensures that every type used by a try-with-resources statement extends java.lang.AutoCloseable.
+   *
+   * @param resources a list of resource expressions
+   */
+  private void handleSyntheticResources(List<Expression> resources) {
+    // Resource expressions can be:
+    // * names
+    // * field accesses
+    // * a new local variable declaration
+    // In the former two cases, we have to wait to handle the synthetic resources
+    // until the expression can be solved. For the latter, we have to wait until the
+    // declared type is solvable.
+    for (Expression resource : resources) {
+      if (resource.isVariableDeclarationExpr()) {
+        VariableDeclarationExpr asVar = resource.asVariableDeclarationExpr();
+        String fqn;
+        try {
+          fqn = asVar.calculateResolvedType().describe();
+        } catch (UnsolvedSymbolException e) {
+          gotException();
+          continue;
+        }
+        makeClassAutoCloseable(fqn);
+      } else if (resource.isNameExpr()) {
+        NameExpr asName = resource.asNameExpr();
+        String fqn;
+        try {
+          fqn = asName.resolve().getType().describe();
+        } catch (UnsolvedSymbolException e) {
+          gotException();
+          continue;
+        }
+        makeClassAutoCloseable(fqn);
+      } else if (resource.isFieldAccessExpr()) {
+        FieldAccessExpr asField = resource.asFieldAccessExpr();
+        String fqn;
+        try {
+          fqn = asField.resolve().getType().describe();
+        } catch (UnsolvedSymbolException e) {
+          gotException();
+          continue;
+        }
+        makeClassAutoCloseable(fqn);
+      } else {
+        throw new RuntimeException(
+            "unexpected type of node in a try-with-resources expression: "
+                + resource.getClass()
+                + "\nresouce was "
+                + resource);
+      }
+    }
+  }
+
+  /**
+   * Makes the synthetic class with the given name implement AutoCloseable, if such a synthetic
+   * class exists. If not, silently does nothing, since that should only happen when encounting a
+   * non-synthetic class, which must already implement AutoCloseable if it is used in a
+   * try-with-resources that compiles (i.e., this method relies on the assumption that the input
+   * compiles).
+   *
+   * @param fqn a fully-qualified name
+   */
+  private void makeClassAutoCloseable(String fqn) {
+    for (UnsolvedClassOrInterface sytheticClass : missingClass) {
+      if (sytheticClass.getQualifiedClassName().equals(fqn)) {
+        sytheticClass.implement("java.lang.AutoCloseable");
+        sytheticClass.addMethod(UnsolvedMethod.CLOSE);
+      }
+    }
   }
 
   @Override
@@ -916,6 +997,23 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
       insidePotentialUsedMember = true;
     }
     addTypeVariableScope(node.getTypeParameters());
+    if (targetMethods.contains(getSignature(node))) {
+      // If this constructor is a target method, and the modularity model
+      // permits reasoning about field assignments in constructors, then
+      // we need to preserve the types of all of the fields declared in the
+      // class.
+      if (modularityModel.preserveAllFieldsIfTargetIsConstructor()) {
+        // This cast is safe, because a constructor must be contained in a class declaration.
+        ClassOrInterfaceDeclaration thisClass =
+            (ClassOrInterfaceDeclaration) JavaParserUtil.getEnclosingClassLike(node);
+        for (FieldDeclaration field : thisClass.getFields()) {
+          for (VariableDeclarator variable : field.getVariables()) {
+            Type type = variable.getType();
+            resolveTypeExpr(type);
+          }
+        }
+      }
+    }
     Visitable result = super.visit(node, arg);
     typeVariables.removeFirst();
     insidePotentialUsedMember = oldInsidePotentialUsedMember;
@@ -1847,6 +1945,7 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
       Node method, String className, String desiredReturnType, boolean updatingInterface) {
     String methodName = "";
     List<String> listOfParameters = new ArrayList<>();
+    List<String> listOfExceptions = new ArrayList<>();
     String accessModifer = "public";
     if (method instanceof MethodCallExpr) {
       methodName = ((MethodCallExpr) method).getNameAsString();
@@ -1855,9 +1954,11 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
     }
     // method is a MethodDeclaration
     else {
-      methodName = ((MethodDeclaration) method).getNameAsString();
-      accessModifer = ((MethodDeclaration) method).getAccessSpecifier().asString();
-      for (Parameter para : ((MethodDeclaration) method).getParameters()) {
+      MethodDeclaration methodDecl = (MethodDeclaration) method;
+
+      methodName = methodDecl.getNameAsString();
+      accessModifer = methodDecl.getAccessSpecifier().asString();
+      for (Parameter para : methodDecl.getParameters()) {
         Type paraType = para.getType();
         String paraTypeAsString = paraType.asString();
         try {
@@ -1870,6 +1971,23 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
         }
         listOfParameters.add(paraTypeAsString);
       }
+
+      for (ReferenceType exception : methodDecl.getThrownExceptions()) {
+        String exceptionTypeAsString = exception.asString();
+        try {
+          // if possible, opt for fully-qualified names.
+          exceptionTypeAsString = exception.resolve().describe();
+        } catch (UnsolvedSymbolException | UnsupportedOperationException e) {
+          // avoiding ignored catch blocks errors.
+          listOfExceptions.add(exceptionTypeAsString);
+          continue;
+        }
+        listOfExceptions.add(exceptionTypeAsString);
+      }
+    }
+    if (listOfParameters.contains(JavaTypeCorrect.SYNTHETIC_UNCONSTRAINED_TYPE)) {
+      // return early: this method is an artifact of JavaTypeCorrect and won't be needed.
+      return;
     }
     String returnType = "";
     if (desiredReturnType.equals("")) {
@@ -1877,9 +1995,15 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
     } else {
       returnType = desiredReturnType;
     }
+
     UnsolvedMethod thisMethod =
         new UnsolvedMethod(
-            methodName, returnType, listOfParameters, updatingInterface, accessModifer);
+            methodName,
+            returnType,
+            listOfParameters,
+            updatingInterface,
+            accessModifer,
+            listOfExceptions);
     UnsolvedClassOrInterface missingClass =
         updateUnsolvedClassWithClassName(className, false, false, thisMethod);
     syntheticMethodReturnTypeAndClass.put(returnType, missingClass);
@@ -3408,7 +3532,9 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
       String correctTypeName) {
     // Make sure that correctTypeName is fully qualified, so that we don't need to
     // add an import to the synthetic class.
-    correctTypeName = lookupFQNs(correctTypeName);
+    if (!correctTypeName.contains(JavaTypeCorrect.SYNTHETIC_UNCONSTRAINED_TYPE)) {
+      correctTypeName = lookupFQNs(correctTypeName);
+    }
     boolean updatedSuccessfully = false;
     UnsolvedClassOrInterface classToSearch = new UnsolvedClassOrInterface(className, packageName);
     Iterator<UnsolvedClassOrInterface> iterator = missingClass.iterator();
@@ -3467,16 +3593,81 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
             new ModifierVisitor<Void>() {
               @Override
               public Visitable visit(ClassOrInterfaceType type, Void p) {
-                if (classAndPackageMap.containsKey(type.asString())) {
-                  return new ClassOrInterfaceType(
-                      classAndPackageMap.get(type.asString()) + "." + type.asString());
-                } else {
+                StringBuilder fullyQualifiedName = new StringBuilder();
+                if (classAndPackageMap.containsKey(JavaParserUtil.erase(type.asString()))) {
+                  fullyQualifiedName.append(classAndPackageMap.get(type.asString()));
+                  fullyQualifiedName.append(".");
+                } else if (!type.getTypeArguments().isPresent()) {
+                  // This type is in the same package and doesn't contain any type parameters
                   return super.visit(type, p);
                 }
+
+                NodeList<Type> typeArguments = type.getTypeArguments().orElse(null);
+
+                if (typeArguments != null) {
+                  fullyQualifiedName.append(
+                      type.asString().substring(0, type.asString().indexOf('<') + 1));
+
+                  for (int i = 0; i < typeArguments.size(); i++) {
+                    Type typeArgument = typeArguments.get(i);
+                    lookupTypeArgumentFQN(fullyQualifiedName, typeArgument);
+
+                    if (i < typeArguments.size() - 1) {
+                      fullyQualifiedName.append(", ");
+                    }
+                  }
+                  fullyQualifiedName.append(">");
+                } else {
+                  fullyQualifiedName.append(type.asString());
+                }
+
+                return StaticJavaParser.parseClassOrInterfaceType(fullyQualifiedName.toString());
               }
             },
             null);
     return typeVarDecl + parsedJavac.toString();
+  }
+
+  /**
+   * Helper method for lookupFQNs which adds the fully qualified type argument to
+   * fullyQualifiedName.
+   *
+   * @param fullyQualifiedName the fully qualified name to build
+   * @param typeArgument the type argument to lookup
+   */
+  private void lookupTypeArgumentFQN(StringBuilder fullyQualifiedName, Type typeArgument) {
+    String erased = JavaParserUtil.erase(typeArgument.asString());
+    if (classAndPackageMap.containsKey(erased)) {
+      fullyQualifiedName
+          .append(classAndPackageMap.get(erased))
+          .append(".")
+          .append(typeArgument.asString());
+    } else if (JavaLangUtils.isJavaLangName(erased)) {
+      // Keep java.lang type arguments as is (Integer, String, etc.)
+      fullyQualifiedName.append(typeArgument.asString());
+    } else if (typeArgument.isWildcardType()) {
+      WildcardType asWildcardType = typeArgument.asWildcardType();
+
+      if (asWildcardType.getSuperType().isPresent()) {
+        fullyQualifiedName.append("? super ");
+        lookupTypeArgumentFQN(fullyQualifiedName, asWildcardType.getSuperType().get());
+      } else if (asWildcardType.getExtendedType().isPresent()) {
+        fullyQualifiedName.append("? extends ");
+        lookupTypeArgumentFQN(fullyQualifiedName, asWildcardType.getExtendedType().get());
+      }
+    } else if (isAClassPath(erased)) {
+      // If it's already a fully qualified name, don't do anything
+      fullyQualifiedName.append(typeArgument.asString());
+    } else {
+      // If it's not imported, it's probably in the same package
+      // TODO: handle already fully qualified generic type arguments. Right now JavaTypeCorrect
+      // only outputs the simple class name, so there is no way to get its fully qualified name
+      // here without ambiguity (i.e. org.example.Foo and com.example.Foo have different signatures)
+      // with the same simple class name
+      // Check MethodReturnFullyQualifiedGenericTest for more details; the current return type in
+      // Bar.java is com.example.InOtherPackage2 rather than com.foo.InOtherPackage2 (expected)
+      fullyQualifiedName.append(currentPackage).append(".").append(typeArgument.toString());
+    }
   }
 
   /**
@@ -3492,6 +3683,17 @@ public class UnsolvedSymbolVisitor extends SpeciminStateVisitor {
     // This one may or may not be present. If it is not, exit early and do nothing.
     UnsolvedClassOrInterface correctType = getMissingClassWithQualifiedName(correctTypeName);
     if (correctType == null) {
+      if (correctTypeName.contains(JavaTypeCorrect.SYNTHETIC_UNCONSTRAINED_TYPE)) {
+        // Special case: if the new type name is the synthetic unconstrained type name
+        // placeholder, there is one more thing to do: replace any and all parameter types
+        // in synthetic classes that use this (soon to be deleted) synthetic type name
+        // with java.lang.Object.
+        for (UnsolvedClassOrInterface unsolvedClass : missingClass) {
+          for (UnsolvedMethod m : unsolvedClass.getMethods()) {
+            m.replaceParamWithObject(incorrectTypeName);
+          }
+        }
+      }
       return;
     }
 

@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import org.checkerframework.checker.signature.qual.ClassGetSimpleName;
+import org.checkerframework.specimin.modularity.ModularityModel;
 
 /**
  * This visitor contains shared logic and state for the Specimin's various XVisitor classes. It
@@ -30,6 +31,9 @@ import org.checkerframework.checker.signature.qual.ClassGetSimpleName;
  * additional state tracking in the future.
  */
 public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
+
+  /** The modularity model currently in use. */
+  protected final ModularityModel modularityModel;
 
   /**
    * Set containing the signatures of target methods. The Strings in the set are the fully-qualified
@@ -66,11 +70,26 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
    */
   protected boolean insideTargetMember = false;
 
+  /**
+   * Is the visitor inside a target constructor? If this boolean is true, then {@link
+   * #insideTargetMember} is also guaranteed to be true.
+   */
+  protected boolean insideTargetCtor = false;
+
   /** The simple name of the class currently visited */
   protected @ClassGetSimpleName String className = "";
 
   /** The qualified name of the class currently being visited. */
   protected String currentClassQualifiedName = "";
+
+  /**
+   * The fully-qualified names of each field that is assigned by a target constructor. The
+   * assignments to these fields will be preserved, so Specimin needs to avoid adding an initializer
+   * for them if they are final (as it does for other, non-assigned-by-target final fields). Set by
+   * {@link TargetMemberFinderVisitor} but stored here so that it is easily available later when
+   * pruning.
+   */
+  protected final Set<String> fieldsAssignedByTargetCtors;
 
   /**
    * Constructs a new instance with the provided sets. Use this constructor only for the first
@@ -90,6 +109,7 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
       Set<String> targetFields,
       Set<String> usedMembers,
       Set<String> usedTypeElements,
+      ModularityModel model,
       Map<String, Path> existingClassesToFilePath) {
     this.targetMethods = new HashSet<>();
     for (String methodSignature : targetMethods) {
@@ -100,6 +120,8 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
     this.usedMembers = usedMembers;
     this.usedTypeElements = usedTypeElements;
     this.existingClassesToFilePath = existingClassesToFilePath;
+    this.fieldsAssignedByTargetCtors = new HashSet<>();
+    this.modularityModel = model;
   }
 
   /**
@@ -117,6 +139,8 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
     this.insideTargetMember = previous.insideTargetMember;
     this.className = previous.className;
     this.currentClassQualifiedName = previous.currentClassQualifiedName;
+    this.fieldsAssignedByTargetCtors = previous.fieldsAssignedByTargetCtors;
+    this.modularityModel = previous.modularityModel;
   }
 
   /**
@@ -169,7 +193,10 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
     String methodQualifiedSignature = getSignature(ctorDecl);
     boolean oldInsideTargetMember = insideTargetMember;
     insideTargetMember = oldInsideTargetMember || targetMethods.contains(methodQualifiedSignature);
+    boolean oldInsideTargetCtor = insideTargetCtor;
+    insideTargetCtor = oldInsideTargetCtor || targetMethods.contains(methodQualifiedSignature);
     Visitable result = super.visit(ctorDecl, p);
+    insideTargetCtor = oldInsideTargetCtor;
     insideTargetMember = oldInsideTargetMember;
     return result;
   }
@@ -229,9 +256,10 @@ public abstract class SpeciminStateVisitor extends ModifierVisitor<Void> {
   }
 
   /**
-   * Determines if the given Node is a target/used method or class.
+   * Determines if the given Node is a target/used member or class.
    *
    * @param node The node to check
+   * @return true iff the given Node is a target/used member or type.
    */
   protected boolean isTargetOrUsed(Node node) {
     String qualifiedName;

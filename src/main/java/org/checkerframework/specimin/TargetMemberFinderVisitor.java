@@ -10,6 +10,7 @@ import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.ast.expr.AssignExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.LambdaExpr;
@@ -25,6 +26,7 @@ import com.github.javaparser.ast.type.ReferenceType;
 import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.ast.type.UnionType;
 import com.github.javaparser.ast.visitor.Visitable;
+import com.github.javaparser.resolution.MethodUsage;
 import com.github.javaparser.resolution.UnsolvedSymbolException;
 import com.github.javaparser.resolution.declarations.ResolvedConstructorDeclaration;
 import com.github.javaparser.resolution.declarations.ResolvedEnumConstantDeclaration;
@@ -45,10 +47,10 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * The main visitor for Specimin's first phase, which locates the target method(s) and compiles
+ * The main visitor for Specimin's first phase, which locates the target member(s) and compiles
  * information on what specifications they use.
  */
-public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
+public class TargetMemberFinderVisitor extends SpeciminStateVisitor {
   /**
    * The names of the target methods. The format is
    * class.fully.qualified.Name#methodName(Param1Type, Param2Type, ...). All the names will have
@@ -68,6 +70,9 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
    * name/signature of a method actually is.
    */
   private final Map<String, Set<String>> unfoundMethods;
+
+  /** Same as the unfoundMethods set, but for fields */
+  private final Map<String, Set<String>> unfoundFields = new HashMap<>();
 
   /**
    * This map connects the resolved declaration of a method to the interface that contains it, if
@@ -100,7 +105,7 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
    * @param nonPrimaryClassesToPrimaryClass map connecting non-primary classes with their
    *     corresponding primary classes
    */
-  public TargetMethodFinderVisitor(
+  public TargetMemberFinderVisitor(
       SpeciminStateVisitor previous, Map<String, String> nonPrimaryClassesToPrimaryClass) {
     super(previous);
     targetMethodNames = new HashSet<>();
@@ -109,6 +114,7 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
     }
     unfoundMethods = new HashMap<>(targetMethods.size());
     targetMethodNames.forEach(m -> unfoundMethods.put(m, new HashSet<>()));
+    targetFields.forEach(f -> unfoundFields.put(f, new HashSet<>()));
     this.nonPrimaryClassesToPrimaryClass = nonPrimaryClassesToPrimaryClass;
   }
 
@@ -123,6 +129,19 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
    */
   public Map<String, Set<String>> getUnfoundMethods() {
     return unfoundMethods;
+  }
+
+  /**
+   * Returns the fields that so far this visitor has not located from its target list. Usually, this
+   * should be checked after running the visitor to ensure that it is empty. The targets are the
+   * keys in the returned maps; the values are fields in the same class that were considered but
+   * were not the target (useful for issuing error messages).
+   *
+   * @return the fields that so far this visitor has not located from its target list, mapped to the
+   *     candidate fields that were considered
+   */
+  public Map<String, Set<String>> getUnfoundFields() {
+    return unfoundFields;
   }
 
   /**
@@ -169,6 +188,27 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
     }
   }
 
+  /**
+   * Updates unfoundFields so that the appropriate elements have their set of considered fields
+   * updated to match a field that was not a target field.
+   *
+   * @param fieldAsString the field that wasn't a target field
+   */
+  private void updateUnfoundFields(String fieldAsString) {
+    Set<String> targetFieldsInClass =
+        targetFields.stream()
+            .filter(t -> t.startsWith(this.currentClassQualifiedName))
+            .collect(Collectors.toSet());
+
+    for (String targetFieldInClass : targetFieldsInClass) {
+      // This check is necessary to avoid an NPE if the target field
+      // in question has already been removed from unfoundFields.
+      if (unfoundFields.containsKey(targetFieldInClass)) {
+        unfoundFields.get(targetFieldInClass).add(fieldAsString);
+      }
+    }
+  }
+
   @Override
   public Visitable visit(PackageDeclaration decl, Void p) {
     this.currentPackage = decl.getNameAsString();
@@ -196,6 +236,8 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
     String constructorMethodAsString = method.getDeclarationAsString(false, false, false);
     // the methodName will be something like this: "com.example.Car#Car()"
     String methodName = this.currentClassQualifiedName + "#" + constructorMethodAsString;
+    // remove spaces
+    methodName = methodName.replaceAll("\\s", "");
     if (this.targetMethodNames.contains(methodName)) {
       ResolvedConstructorDeclaration resolvedMethod = method.resolve();
       targetMethods.add(resolvedMethod.getQualifiedSignature());
@@ -204,6 +246,18 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
           resolvedMethod.getPackageName() + "." + resolvedMethod.getClassName(),
           usedTypeElements,
           nonPrimaryClassesToPrimaryClass);
+      if (modularityModel.preserveAllFieldsIfTargetIsConstructor()) {
+        // This cast is safe, because a constructor must be contained in a class declaration.
+        ClassOrInterfaceDeclaration thisClass =
+            (ClassOrInterfaceDeclaration) JavaParserUtil.getEnclosingClassLike(method);
+        for (FieldDeclaration field : thisClass.getFields()) {
+          for (VariableDeclarator variable : field.getVariables()) {
+            usedMembers.add(currentClassQualifiedName + "#" + variable.getNameAsString());
+            ResolvedType fieldType = variable.resolve().getType();
+            updateUsedClassBasedOnType(fieldType);
+          }
+        }
+      }
     } else {
       updateUnfoundMethods(methodName);
     }
@@ -230,14 +284,47 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
 
   @Override
   public Visitable visit(VariableDeclarator node, Void arg) {
-    if (insideTargetMember
-        && node.getParentNode().isPresent()
+    if (node.getParentNode().isPresent()
         && node.getParentNode().get() instanceof FieldDeclaration) {
-      Visitable result = super.visit(node, arg);
-      usedTypeElements.add(this.currentClassQualifiedName);
-      return result;
+      String fieldName = this.currentClassQualifiedName + "#" + node.getNameAsString();
+      if (targetFields.contains(fieldName)) {
+        ResolvedFieldDeclaration resolvedField =
+            ((FieldDeclaration) node.getParentNode().get()).resolve();
+        unfoundFields.remove(fieldName);
+        updateUsedClassWithQualifiedClassName(
+            resolvedField.declaringType().getQualifiedName(),
+            usedTypeElements,
+            nonPrimaryClassesToPrimaryClass);
+      } else {
+        updateUnfoundFields(fieldName);
+      }
     }
     return super.visit(node, arg);
+  }
+
+  @Override
+  public Visitable visit(AssignExpr node, Void p) {
+    if (insideTargetCtor) {
+      // check if the LHS is a field
+      Expression lhs = node.getTarget();
+      if (lhs.isFieldAccessExpr()) {
+        FieldAccessExpr asFieldAccess = lhs.asFieldAccessExpr();
+        Expression scope = asFieldAccess.getScope();
+        if (scope.toString().equals("this")) {
+          fieldsAssignedByTargetCtors.add(
+              currentClassQualifiedName + "#" + asFieldAccess.getNameAsString());
+        }
+      } else if (lhs.isNameExpr()) {
+        // could be a field of "this"
+        NameExpr asName = lhs.asNameExpr();
+        ResolvedValueDeclaration resolved = asName.resolve();
+        if (resolved.isField()) {
+          fieldsAssignedByTargetCtors.add(
+              currentClassQualifiedName + "#" + asName.getNameAsString());
+        }
+      }
+    }
+    return super.visit(node, p);
   }
 
   @Override
@@ -416,17 +503,25 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
             resolvedYetStuckMethodCall.add(
                 this.currentClassQualifiedName + "." + call.getNameAsString());
           } else {
-            // Use the scope instead. There are two cases: the scope is an FQN (e.g., in
-            // a call to a fully-qualified static method) or the scope is a simple name.
-            // In the simple name case, append the current package to the front, since
-            // if it had been imported we wouldn't be in this situation.
-            if (UnsolvedSymbolVisitor.isAClassPath(scopeAsString)) {
-              resolvedYetStuckMethodCall.add(scopeAsString + "." + call.getNameAsString());
-              usedTypeElements.add(scopeAsString);
-            } else {
-              resolvedYetStuckMethodCall.add(
-                  getCurrentPackage() + "." + scopeAsString + "." + call.getNameAsString());
-              usedTypeElements.add(getCurrentPackage() + "." + scopeAsString);
+            // Use the scope instead. First, check if it's resolvable. If it is, great -
+            // just use that. If not, then we need to use some heuristics as fallbacks.
+            try {
+              ResolvedType scopeType = scope.calculateResolvedType();
+              resolvedYetStuckMethodCall.add(scopeType.describe() + "." + call.getNameAsString());
+              usedTypeElements.add(scopeType.describe());
+            } catch (Exception e1) {
+              // There are two fallback cases: the scope is an FQN (e.g., in
+              // a call to a fully-qualified static method) or the scope is a simple name.
+              // In the simple name case, append the current package to the front, since
+              // if it had been imported we wouldn't be in this situation.
+              if (UnsolvedSymbolVisitor.isAClassPath(scopeAsString)) {
+                resolvedYetStuckMethodCall.add(scopeAsString + "." + call.getNameAsString());
+                usedTypeElements.add(scopeAsString);
+              } else {
+                resolvedYetStuckMethodCall.add(
+                    getCurrentPackage() + "." + scopeAsString + "." + call.getNameAsString());
+                usedTypeElements.add(getCurrentPackage() + "." + scopeAsString);
+              }
             }
           }
         } else {
@@ -442,6 +537,18 @@ public class TargetMethodFinderVisitor extends SpeciminStateVisitor {
         Expression arg = call.getArgument(i);
         if (arg.isLambdaExpr()) {
           updateUsedClassBasedOnType(decl.getParam(i).getType());
+          // We should mark the abstract method for preservation as well
+          if (decl.getParam(i).getType().isReferenceType()) {
+            ResolvedReferenceType functionalInterface =
+                decl.getParam(i).getType().asReferenceType();
+            for (MethodUsage method : functionalInterface.getDeclaredMethods()) {
+              if (method.getDeclaration().isAbstract()) {
+                preserveMethodDecl(method.getDeclaration());
+                // Only one abstract method per functional interface
+                break;
+              }
+            }
+          }
         }
       }
     }

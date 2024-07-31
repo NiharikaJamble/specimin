@@ -37,6 +37,7 @@ import joptsimple.OptionSpec;
 import org.apache.commons.io.FileUtils;
 import org.checkerframework.checker.signature.qual.ClassGetSimpleName;
 import org.checkerframework.checker.signature.qual.FullyQualifiedName;
+import org.checkerframework.specimin.modularity.ModularityModel;
 import org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler;
 
 /** This class is the main runner for Specimin. Use its main() method to start Specimin. */
@@ -68,6 +69,12 @@ public class SpeciminRunner {
     // class.fully.qualified.Name#fieldName
     OptionSpec<String> targetFieldsOptions = optionParser.accepts("targetField").withRequiredArg();
 
+    // This option is to specify the modularity model. By default, the modularity model is
+    // the model for the javac type system, which is shared by the Checker Framework.
+    // Accepts the arguments: "javac", "cf", "nullaway"
+    OptionSpec<String> modularityModelOption =
+        optionParser.accepts("modularityModel").withOptionalArg().defaultsTo("cf");
+
     // The directory in which to output the results.
     OptionSpec<String> outputDirectoryOption =
         optionParser.accepts("outputDirectory").withRequiredArg();
@@ -86,7 +93,8 @@ public class SpeciminRunner {
         jarFiles,
         options.valuesOf(targetMethodsOption),
         options.valuesOf(targetFieldsOptions),
-        options.valueOf(outputDirectoryOption));
+        options.valueOf(outputDirectoryOption),
+        options.valueOf(modularityModelOption));
   }
 
   /**
@@ -110,6 +118,33 @@ public class SpeciminRunner {
       List<String> targetFieldNames,
       String outputDirectory)
       throws IOException {
+    performMinimization(
+        root, targetFiles, jarPaths, targetMethodNames, targetFieldNames, outputDirectory, "cf");
+  }
+
+  /**
+   * This method acts as an API for users who want to incorporate Specimin as a library into their
+   * projects. It offers an easy way to do the minimization job without needing to directly call
+   * Specimin's main method.
+   *
+   * @param root The root directory of the input files.
+   * @param targetFiles A list of files that contain the target methods.
+   * @param jarPaths Paths to relevant JAR files.
+   * @param targetMethodNames A set of target method names to be preserved.
+   * @param targetFieldNames A set of target field names to be preserved.
+   * @param outputDirectory The directory for the output.
+   * @param modularityModelCode the modularity model to use
+   * @throws IOException if there is an exception
+   */
+  public static void performMinimization(
+      String root,
+      List<String> targetFiles,
+      List<String> jarPaths,
+      List<String> targetMethodNames,
+      List<String> targetFieldNames,
+      String outputDirectory,
+      String modularityModelCode)
+      throws IOException {
     // The set of path of files that have been created by Specimin. We must be careful to delete all
     // those files in the end, because otherwise they can pollute the input directory. To do that,
     // we need to register a shutdown hook with the JVM.
@@ -123,6 +158,8 @@ public class SpeciminRunner {
               }
             });
 
+    ModularityModel model = ModularityModel.createModularityModel(modularityModelCode);
+
     performMinimizationImpl(
         root,
         targetFiles,
@@ -130,6 +167,7 @@ public class SpeciminRunner {
         targetMethodNames,
         targetFieldNames,
         outputDirectory,
+        model,
         createdClass);
   }
 
@@ -144,6 +182,7 @@ public class SpeciminRunner {
    * @param targetMethodNames A set of target method names to be preserved.
    * @param targetFieldNames A set of target field names to be preserved.
    * @param outputDirectory The directory for the output.
+   * @param modularityModel the modularity model
    * @throws IOException if there is an exception
    */
   private static void performMinimizationImpl(
@@ -153,6 +192,7 @@ public class SpeciminRunner {
       List<String> targetMethodNames,
       List<String> targetFieldNames,
       String outputDirectory,
+      ModularityModel modularityModel,
       Set<Path> createdClass)
       throws IOException {
     // To facilitate string manipulation in subsequent methods, ensure that 'root' ends with a
@@ -230,7 +270,8 @@ public class SpeciminRunner {
             root,
             existingClassesToFilePath,
             new HashSet<>(targetMethodNames),
-            new HashSet<>(targetFieldNames));
+            new HashSet<>(targetFieldNames),
+            modularityModel);
     addMissingClass.setClassesFromJar(jarPaths);
 
     Map<String, String> typesToChange = new HashMap<>();
@@ -354,8 +395,8 @@ public class SpeciminRunner {
     // what specifications they use, and the second phase takes that information
     // and removes all non-used code.
 
-    TargetMethodFinderVisitor finder =
-        new TargetMethodFinderVisitor(enumVisitor, nonPrimaryClassesToPrimaryClass);
+    TargetMemberFinderVisitor finder =
+        new TargetMemberFinderVisitor(enumVisitor, nonPrimaryClassesToPrimaryClass);
 
     for (CompilationUnit cu : parsedTargetFiles.values()) {
       cu.accept(finder, null);
@@ -365,8 +406,16 @@ public class SpeciminRunner {
     if (!unfoundMethods.isEmpty()) {
       throw new RuntimeException(
           "Specimin could not locate the following target methods in the target files:\n"
-              + unfoundMethodsTable(unfoundMethods));
+              + unfoundMembersTable(unfoundMethods, true));
     }
+
+    Map<String, Set<String>> unfoundFields = finder.getUnfoundFields();
+    if (!unfoundFields.isEmpty()) {
+      throw new RuntimeException(
+          "Specimin could not locate the following target fields in the target files:\n"
+              + unfoundMembersTable(unfoundFields, false));
+    }
+
     SolveMethodOverridingVisitor solveMethodOverridingVisitor =
         new SolveMethodOverridingVisitor(finder);
     for (CompilationUnit cu : parsedTargetFiles.values()) {
@@ -453,10 +502,20 @@ public class SpeciminRunner {
 
     // cache to avoid called Files.createDirectories repeatedly with the same arguments
     Set<Path> createdDirectories = new HashSet<>();
+    Set<String> targetFilesAbsolutePaths = new HashSet<>();
+
+    for (String target : targetFiles) {
+      File targetFile = new File(target);
+      // Convert to absolute path for comparison
+      targetFilesAbsolutePaths.add(targetFile.getAbsolutePath());
+    }
 
     for (Entry<String, CompilationUnit> target : parsedTargetFiles.entrySet()) {
-      // ignore classes from the Java package.
-      if (target.getKey().startsWith("java/")) {
+      // ignore classes from the Java package, unless we are targeting a JDK file.
+      // However, all related java/ files should not be included (as in used, but not targeted)
+      String absolutePath = new File(target.getKey()).getAbsolutePath();
+      if (!targetFilesAbsolutePaths.contains(absolutePath)
+          && (target.getKey().startsWith("java/") || target.getKey().startsWith("java\\"))) {
         continue;
       }
       // If a compilation output's entire body has been removed and the related class is not used by
@@ -516,7 +575,7 @@ public class SpeciminRunner {
     AnnotationParameterTypesVisitor annotationParameterTypesVisitor =
         new AnnotationParameterTypesVisitor(last);
 
-    Set<String> relatedClass = new HashSet<>(parsedTargetFiles.keySet());
+    Set<String> classesToParse = new HashSet<>();
     Set<CompilationUnit> compilationUnitsToSolveAnnotations =
         new HashSet<>(parsedTargetFiles.values());
 
@@ -527,33 +586,58 @@ public class SpeciminRunner {
 
       // add all files related to the target annotations
       for (String annoFullName : annotationParameterTypesVisitor.getClassesToAdd()) {
+        if (annotationParameterTypesVisitor.getUsedTypeElements().contains(annoFullName)) {
+          continue;
+        }
         String directoryOfFile = annoFullName.replace(".", "/") + ".java";
         File thisFile = new File(root + directoryOfFile);
         // classes from JDK are automatically on the classpath, so UnsolvedSymbolVisitor will not
         // create synthetic files for them
         if (thisFile.exists()) {
-          relatedClass.add(directoryOfFile);
+          classesToParse.add(directoryOfFile);
+        } else {
+          // The given class may be an inner class, so we should find its encapsulating class
+          // Assuming following Java conventions, we will find the first instance of .{capital}
+          // and trim off subsequent .*s.
+          int dot = annoFullName.indexOf('.');
+          while (dot != -1) {
+            if (Character.isUpperCase(annoFullName.charAt(dot + 1))) {
+              dot = annoFullName.indexOf('.', dot + 1);
+              break;
+            }
+            dot = annoFullName.indexOf('.', dot + 1);
+          }
+
+          if (dot != -1) {
+            directoryOfFile = annoFullName.substring(0, dot).replace(".", "/") + ".java";
+            thisFile = new File(root + directoryOfFile);
+            // This inner class was just added, so we should re-parse the file
+            if (thisFile.exists()) {
+              classesToParse.add(directoryOfFile);
+            }
+          }
         }
       }
 
       compilationUnitsToSolveAnnotations.clear();
 
-      for (String directory : relatedClass) {
-        // directories already in parsedTargetFiles are original files in the root directory, we are
-        // not supposed to update them.
-        if (!parsedTargetFiles.containsKey(directory)) {
-          try {
-            // We need to continue solving annotations and parameters in newly added annotation
-            // files
+      for (String directory : classesToParse) {
+        // We need to continue solving annotations and parameters in newly added annotation files
+        try {
+          // directories already in parsedTargetFiles are original files in the root directory, we
+          // are not supposed to update them.
+          if (!parsedTargetFiles.containsKey(directory)) {
             CompilationUnit parsed = parseJavaFile(root, directory);
             parsedTargetFiles.put(directory, parsed);
-            compilationUnitsToSolveAnnotations.add(parsed);
-          } catch (ParseProblemException e) {
-            // TODO: Figure out why the CI is crashing.
-            continue;
           }
+          compilationUnitsToSolveAnnotations.add(parsedTargetFiles.get(directory));
+        } catch (ParseProblemException e) {
+          // TODO: Figure out why the CI is crashing.
+          continue;
         }
       }
+
+      classesToParse.clear();
 
       annotationParameterTypesVisitor
           .getUsedTypeElements()
@@ -564,20 +648,24 @@ public class SpeciminRunner {
   }
 
   /**
-   * Helper method to create a human-readable table of the unfound methods and each method in the
+   * Helper method to create a human-readable table of the unfound members and each member in the
    * same class that was considered.
    *
-   * @param unfoundMethods the unfound methods and the methods that were considered
+   * @param unfoundMembers the unfound members and the members that were considered
+   * @param isMethod true if methods, false if fields
    * @return a human-readable string representation
    */
-  private static String unfoundMethodsTable(Map<String, Set<String>> unfoundMethods) {
+  private static String unfoundMembersTable(
+      Map<String, Set<String>> unfoundMembers, boolean isMethod) {
     StringBuilder sb = new StringBuilder();
-    for (String unfoundMethod : unfoundMethods.keySet()) {
+    for (String unfoundMember : unfoundMembers.keySet()) {
       sb.append("* ")
-          .append(unfoundMethod)
-          .append("\n  Considered these methods from the same class:\n");
-      for (String consideredMethod : unfoundMethods.get(unfoundMethod)) {
-        sb.append("    * ").append(consideredMethod).append("\n");
+          .append(unfoundMember)
+          .append("\n  Considered these ")
+          .append(isMethod ? "methods" : "fields")
+          .append(" from the same class:\n");
+      for (String consideredMember : unfoundMembers.get(unfoundMember)) {
+        sb.append("    * ").append(consideredMember).append("\n");
       }
     }
     return sb.toString();
