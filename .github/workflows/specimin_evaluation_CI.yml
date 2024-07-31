@@ -63,10 +63,17 @@ jobs:
             exit 1
           fi
 
-      - name: Clone ASHE Project 
+      - name: Download git-clone-related script
         run: |
-          set -ex
-          git clone https://github.com/njit-jerse/ASHE_Automated-Software-Hardening-for-Entrypoints ASHE
+         set -ex
+         curl -L -o git-clone-related https://raw.githubusercontent.com/plume-lib/git-scripts/main/git-clone-related
+         chmod +x git-clone-related
+         
+      - name: Clone ASHE Project using git-clone-related
+        run: |
+         set -ex
+         git clone https://github.com/njit-jerse/ASHE_Automated-Software-Hardening-for-Entrypoints ASHE
+         ./git-clone-related njit-jerse ASHE_Automated-Software-Hardening-for-Entrypoints ASHE
           
       - name: Create ASHE Clone SPACE Directory
         run: |
