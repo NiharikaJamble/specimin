@@ -109,7 +109,8 @@ public class JavaParserUtil {
     } 
     //else if (value.isStringLiteralExpr()) {
       //return "String";
-    } else if (value.isIntegerLiteralExpr()) {
+  //  } 
+    else if (value.isIntegerLiteralExpr()) {
       return "int";
     } else if (value.isLongLiteralExpr()) {
       return "long";
